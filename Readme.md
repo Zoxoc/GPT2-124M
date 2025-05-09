@@ -1,0 +1,1 @@
+This is a reproduction of gpt-2 but not the 1.5B one. We are reproducing the 124M model.
