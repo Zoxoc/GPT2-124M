@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-# ---------------------------------------------------------
+# -------------------------------------------------------------------------------------------------
 
 
 @dataclass
@@ -78,9 +78,9 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln1 = nn.LayerNorm(config.n_embd)
+        self.ln_1 = nn.LayerNorm(config.n_embd)
         self.attn = CasualSelfAttention(config)
-        self.ln2 = nn.LayerNorm(config.n_embd)
+        self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
     def forward(self, x):
@@ -156,7 +156,7 @@ class GPT(nn.Module):
             if any(k.endswith(w) for w in transposed):
                 # special treatment for the Conv1D weights we need to transpose
                 assert sd_hf[k].shape[::-1] == sd[k].shape
-                
+
                 #Tells PyTorch "don't track gradients" while doing this copy - we’re not training here, just copying.
                 with torch.no_grad(): 
                     sd[k].copy_(sd_hf[k].t())
@@ -167,3 +167,8 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
 
         return model
+
+#-------------------------------------------------------------------------------------------------
+
+model = GPT.from_pretrained('gpt2')
+print("Working 🍾")
