@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import math
 
 # -------------------------------------------------------------------------------------------------
 
@@ -273,22 +274,51 @@ fusing kernels, and minimizing trips between memory and GPU — which improves
 performance."""
 model = torch.compile(model)
 
+#learning_rate with cosine decay (GPT-3)
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+
+def get_lr(iteration):
+    # 1. Linear warmup for warmup_iters steps
+    if iteration < warmup_steps:
+        return max_lr * (iteration+1) / warmup_steps
+    # 2. If epoch > lr_decay_iters, return min learning rate
+    if iteration > max_steps:
+        return min_lr
+    # 3. In between, use cosine decay down to min learning rate
+    decay_ratio = (iteration - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) #coeff starts at 1 and goes to 0
+
+    return min_lr + coeff * (max_lr - min_lr)
+
 #optimize
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50):
+#β1 = 0.9, β2 = 0.95 & ε = 10^-8 from GPT-3 paper
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8) 
+for step in range(max_steps):
     t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
     with torch.autocast(device_type=device, dtype=torch.bfloat16):
         logits, loss = model(x, y)
-    loss.backward()                                                  
+    loss.backward()
+    #It clips (limits) the gradients of your model’s parameters during backpropagation to prevent them from getting too large, which can destabilize training.
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+    #determine and set the learning rate for this iteration     
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
     optimizer.step()
     torch.cuda.synchronize() #wait for the gpu to finish the scheduled work
     t1 = time.time()
-    dt = (t1 - t0)*1000 #time difference in milliseconds
-    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"step{i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
+    dt = (t1 - t0) #time difference in milliseconds
+    tokens_per_sec = (train_loader.B * train_loader.T) / dt
+    print(f"step{i:4D} | loss: {loss.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
 
 import sys; sys.exit(0)
 
