@@ -308,7 +308,7 @@ for step in range(max_steps):
     #It clips (limits) the gradients of your model’s parameters during backpropagation to prevent them from getting too large, which can destabilize training.
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
-    #determine and set the learning rate for this iteration     
+    #determine and set the learning rate for this iteration
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
@@ -318,7 +318,7 @@ for step in range(max_steps):
     t1 = time.time()
     dt = (t1 - t0) #time difference in milliseconds
     tokens_per_sec = (train_loader.B * train_loader.T) / dt
-    print(f"step{i:4D} | loss: {loss.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+    print(f"step{step:4D} | loss: {loss.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
 
 import sys; sys.exit(0)
 
