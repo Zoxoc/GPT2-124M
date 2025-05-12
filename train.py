@@ -64,7 +64,7 @@ class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
-        self.gelu = nn.GELU(approximate='tanh')
+        self.gelu = nn.GELU(approximate='tanh') #smoother version of ReLU
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
         self.c_proj.RESIDUAL_SCALE_INIT = 1
 
@@ -253,7 +253,7 @@ class DataLoaderLite:
 #-------------------------------------------------------------------------------------------------
 
 import time
-device = 'mps' #im using mps because i have a macbook, if you have a nvidia gpu use cuda
+device = 'cuda' #im using a rented A100 GPU from RunPod, to train the model
 
 #for reproducability
 torch.manual_seed(1337)
@@ -261,9 +261,17 @@ torch.mps.manual_seed(1337)
 
 train_loader = DataLoaderLite(B=16, T=1024)
 
+torch.set_float32_matmul_precision('high') #so it takes Tensor32 internally
+
 #torch randomly initialises the weights
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304)) #as 50,257 is not a power of 2
 model.to(device)
+
+"""torch.compile() traces your model and builds an optimized graph of operations. 
+This graph can be run more efficiently — reducing Python overhead, 
+fusing kernels, and minimizing trips between memory and GPU — which improves
+performance."""
+model = torch.compile(model)
 
 #optimize
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
@@ -272,14 +280,15 @@ for i in range(50):
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
     loss.backward()                                                  
     optimizer.step()
-    torch.mps.synchronize() #wait for the gpu to finish the scheduled work
+    torch.cuda.synchronize() #wait for the gpu to finish the scheduled work
     t1 = time.time()
     dt = (t1 - t0)*1000 #time difference in milliseconds
     tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"step{i}, loss: {loss.item()}, dt: {dt:.2f}ms")
+    print(f"step{i}, loss: {loss.item()}, dt: {dt:.2f}ms, tok/sec: {tokens_per_sec:.2f}")
 
 import sys; sys.exit(0)
 
