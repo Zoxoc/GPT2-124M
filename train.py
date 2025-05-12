@@ -252,13 +252,14 @@ class DataLoaderLite:
 
 #-------------------------------------------------------------------------------------------------
 
+import time
 device = 'mps' #im using mps because i have a macbook, if you have a nvidia gpu use cuda
 
 #for reproducability
 torch.manual_seed(1337)
 torch.mps.manual_seed(1337)
 
-train_loader = DataLoaderLite(B=4, T=32)
+train_loader = DataLoaderLite(B=16, T=1024)
 
 #torch randomly initialises the weights
 model = GPT(GPTConfig())
@@ -267,13 +268,17 @@ model.to(device)
 #optimize
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
     logits, loss = model(x, y)
-    loss.backward()
+    loss.backward()                                                  
     optimizer.step()
-    print(f"step{i}, loss: {loss.item()}")
+    torch.mps.synchronize() #wait for the gpu to finish the scheduled work
+    t1 = time.time()
+    dt = (t1 - t0)*1000 #time difference in milliseconds
+    print(f"step{i}, loss: {loss.item()}, dt: {dt:.2f}ms")
 
 import sys; sys.exit(0)
 
