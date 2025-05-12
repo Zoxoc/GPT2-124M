@@ -30,6 +30,7 @@ class CasualSelfAttention(nn.Module):
 
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.RESIDUAL_SCALE_INIT = 1
 
         # regularization
         self.n_head = config.n_head
@@ -65,6 +66,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.RESIDUAL_SCALE_INIT = 1
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -106,6 +108,23 @@ class GPT(nn.Module):
 
         #weight sharing scheme
         self.transformer.wte.weight = self.lm_head.weight
+
+        #initialising parameters
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module): #module = layer
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'RESIDUAL_SCALE_INIT'):
+                # we have 2 residual blocks calculating in each layer
+                std *= (2 * self.config.n_layer) ** -0.5
+            #The underscore (_) means in-place operation. (modifies the tensor directly)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std) 
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias) #used to set an existing tensor to zero
+
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
         #idx is of shape (B, T)
@@ -234,6 +253,10 @@ class DataLoaderLite:
 #-------------------------------------------------------------------------------------------------
 
 device = 'mps' #im using mps because i have a macbook, if you have a nvidia gpu use cuda
+
+#for reproducability
+torch.manual_seed(1337)
+torch.mps.manual_seed(1337)
 
 train_loader = DataLoaderLite(B=4, T=32)
 
