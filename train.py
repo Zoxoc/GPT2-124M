@@ -240,7 +240,7 @@ def configure_optimizers(self, weight_decay, learning_rate, device):
     fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters 
     use_fused = fused_available and device == "cuda"
     print(f"using fused AdamW: {use_fused}")
-    
+
     #β1 = 0.9, β2 = 0.95 & ε = 10^-8 from GPT-3 paper
     optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
     return optimizer
@@ -286,9 +286,17 @@ device = 'cuda' #im using a rented A100 GPU from RunPod, to train the model
 
 #for reproducability
 torch.manual_seed(1337)
-torch.mps.manual_seed(1337)
+torch.cuda.manual_seed(1337)
 
-train_loader = DataLoaderLite(B=16, T=1024)
+total_batch_size = 524288 # 2^19, ~0.5M, in no.of tokens as said in GPT-2 paper
+B = 16 #micro batch size
+T = 1024 #sequence length
+assert total_batch_size % (B * T) == 0, "make sure total_batch_size is divisible by B * T"
+grad_accum_steps = total_batch_size // (B * T)
+print(f"total desired batch size: {total_batch_size}")
+print(f"--> calculated gradient accumulation steps: {grad_accum_steps}")
+
+train_loader = DataLoaderLite(B=B, T=T)
 
 torch.set_float32_matmul_precision('high') #so it takes Tensor32 internally
 
@@ -326,12 +334,23 @@ def get_lr(iteration):
 optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
 for step in range(max_steps):
     t0 = time.time()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        logits, loss = model(x, y)
-    loss.backward()
+
+    loss_accum = 0
+    for micro_step in range(grad_accum_steps)
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        """we have to scale the loss to account for gradient accumulation,
+            because the gradients just add on each successive backward().
+            So we need to average it out as the reduction 
+            for cross_entropy_loss is mean."""
+        loss /= grad_accum_steps
+        #for printing the entire loss
+        loss_accum += loss.detach() #for just the numeric value
+        loss.backward()
+
     #It clips (limits) the gradients of your model’s parameters during backpropagation to prevent them from getting too large, which can destabilize training.
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
@@ -344,8 +363,8 @@ for step in range(max_steps):
     torch.cuda.synchronize() #wait for the gpu to finish the scheduled work
     t1 = time.time()
     dt = (t1 - t0) #time difference in milliseconds
-    tokens_per_sec = (train_loader.B * train_loader.T) / dt
-    print(f"step{step:4D} | loss: {loss.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+    tokens_per_sec = (train_loader.B * train_loader.T * grad_accum_steps) / dt
+    print(f"step{step:4D} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
 
 import sys; sys.exit(0)
 
@@ -355,7 +374,7 @@ max_length = 30
 tokens = enc.encode("Hello, I'm a language model,")
 tokens = torch.tensor(tokens, dtype=torch.long) #(8,)
 tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) #(5, 8)
-x = tokens.to('mps')
+x = tokens.to('cuda')
 
 # generate! right now x is (B, T) where B = 5, T = 8
 # set the seed to 42
