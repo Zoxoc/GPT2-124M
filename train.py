@@ -366,7 +366,7 @@ torch.cuda.manual_seed(1337)
 enc = tiktoken.get_encoding("gpt2")
 
 total_batch_size = 524288 # 2^19, ~0.5M, in no.of tokens as said in GPT-2 paper
-B = 16 #micro batch size
+B = 32 #micro batch size
 T = 1024 #sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -397,11 +397,11 @@ if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module if ddp else model # always contains the unwrapped model
 
-#learning_rate with cosine decay (GPT-3)
+#learning_rate with cosine decay
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 715
-max_steps = 19073
+max_steps = 19073 # ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 
 def get_lr(iteration):
     # 1. Linear warmup for warmup_iters steps
