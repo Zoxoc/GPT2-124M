@@ -10,6 +10,8 @@ from torch.nn import functional as F
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
+from datasets import load_dataset
+from transformers import GPT2TokenizerFast
 import math
 import time
 import inspect
@@ -227,31 +229,31 @@ class GPT(nn.Module):
 
         return model
 
-def configure_optimizers(self, weight_decay, learning_rate, device):
-    #start with all of the candidate parameters (that require grad)
-    param_dict = {pn: p for pn, p in self.named_parameters()}
-    param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-    #create optim groups. Any parameters that is 2D will be weight decayed. otherwise no
-    #i.e. all weight tensors in matmuls + embedding decay, all biases and layernorms don't
-    decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-    nondecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-    optim_groups = [
-        {'params': decay_params, 'weight_decay': weight_decay},
-        {'params': nondecay_params, 'weight_decay': 0.0}
-    ]
-    num_decay_params = sum(p.numel() for p in decay_params)
-    num_nondecay_params = sum(p.numel() for p in nondecay_params)
-    print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-    print(f"num non-decayed parameter tensors: {len(nondecay_params)}, with {num_nondecay_params:,} parameters")
-    # Create AdamW optimizer and use the fused version if it is available
-    #Fuse several GPU operations (like momentum, weight decay, etc.) | Run them more efficiently in one CUDA kernel, reducing overhead
-    fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters 
-    use_fused = fused_available and device == "cuda"
-    print(f"using fused AdamW: {use_fused}")
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        #start with all of the candidate parameters (that require grad)
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        #create optim groups. Any parameters that is 2D will be weight decayed. otherwise no
+        #i.e. all weight tensors in matmuls + embedding decay, all biases and layernorms don't
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nondecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nondecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nondecay_params = sum(p.numel() for p in nondecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nondecay_params)}, with {num_nondecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        #Fuse several GPU operations (like momentum, weight decay, etc.) | Run them more efficiently in one CUDA kernel, reducing overhead
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters 
+        use_fused = fused_available and device == "cuda"
+        print(f"using fused AdamW: {use_fused}")
 
-    #β1 = 0.9, β2 = 0.95 & ε = 10^-8 from GPT-3 paper
-    optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
-    return optimizer
+        #β1 = 0.9, β2 = 0.95 & ε = 10^-8 from GPT-3 paper
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        return optimizer
 
 
 #-------------------------------------------------------------------------------------------------
@@ -261,46 +263,63 @@ def load_tokens(filename):
     ptt = torch.tensor(npt, dtype=torch.long)
     return ptt
 
+
 class DataLoaderLite:
     def __init__(self, B, T, process_rank, num_processes, split):
+        """
+        Streaming loader for FineWeb10B via HuggingFace, with inline 90/10 train/val split.
+        It is taking directly from the web instead of you saving it locally.
+        """
+        assert split in {"train", "val"}
         self.B = B
         self.T = T
+        self.split = split
+
+        # store these so reset() can re-shard
         self.process_rank = process_rank
         self.num_processes = num_processes
-        assert split in {'train', 'val'}
 
-        #get the shard filenames
-        data_root = "edu_fineweb10B"
-        shards = os.listdir(data_root)
-        shards = [s for s in shards if split in s]
-        shards = sorted(shards)
-        shards = [os.path.join(data_root, s) for s in shards]
-        self.shards = shards
-        assert len(shards) > 0, f"No shards found for split {split}"
-        if master_process:
-            print(f"Found {len(shards)} shards for split {split}")
-        self.reset()
+        self.tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+
+        # load & immediately shard the single 'train' split
+        ds = load_dataset("HuggingFaceFW/fineweb-edu", split="train", streaming=True)
+        ds = ds.shard(num_shards=self.num_processes, index=self.process_rank)
+        self.iterator = iter(ds)
+        self.buffer = []
+        self.example_counter = 0
 
     def reset(self):
-        #state, init at shard zero
-        self.current_shard = 0
-        self.tokens = load_tokens(self.shards[self.current_shard])
-        self.current_position = self.B * self.T * self.process_rank
+        """Rewind the stream & clear buffer."""
+        ds = load_dataset("HuggingFaceFW/fineweb-edu", split="train", streaming=True)
+        ds = ds.shard(num_shards=self.num_processes, index=self.process_rank)
+        self.iterator = iter(ds)
+        self.buffer = []
+        self.example_counter = 0
 
+    def _fill_buffer(self, min_tokens=1_000_000):
+        """Accumulate at least min_tokens tokens, applying 90/10 split logic."""
+        while len(self.buffer) < min_tokens:
+            try:
+                ex = next(self.iterator)
+            except StopIteration:
+                break
+            self.example_counter += 1
+            is_val = (self.example_counter % 10 == 0)
+            if self.split == "train" and is_val:
+                continue
+            if self.split == "val" and not is_val:
+                continue
+            self.buffer.extend(self.tokenizer.encode(ex["text"]))
 
     def next_batch(self):
-        B, T = self.B, self.T
-        buf = self.tokens[self.current_position : self.current_position+B*T+1]
-        x = (buf[:-1].view(B, T)) #inputs
-        y = (buf[1:].view(B, T)) #targets
-        #advance the position in the tensor
-        self.current_position += B * T * self.num_processes
-        #if loading the next batch would be out of bounds, reset
-        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
-            self.current_shard = (self.current_shard + 1) % len(self.shards)
-            self.tokens = load_tokens(self.shards[self.current_shard])
-            self.current_position = B * T * self.process_rank
-        
+        """Return x,y of shape (B,T)."""
+        self._fill_buffer(self.B * self.T + 1)
+        needed = self.B * self.T + 1
+        if len(self.buffer) < needed:
+            raise RuntimeError("Ran out of data; call reset() to start over")
+        chunk, self.buffer = self.buffer[:needed], self.buffer[needed:]
+        x = torch.tensor(chunk[:-1], dtype=torch.long).view(self.B, self.T)
+        y = torch.tensor(chunk[1:],  dtype=torch.long).view(self.B, self.T)
         return x, y
 
 #-------------------------------------------------------------------------------------------------
@@ -398,7 +417,7 @@ if ddp:
 raw_model = model.module if ddp else model # always contains the unwrapped model
 
 #learning_rate with cosine decay
-max_lr = 6e-4
+max_lr = 6e-4 * 3
 min_lr = max_lr * 0.1
 warmup_steps = 715
 max_steps = 19073 # ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
@@ -476,6 +495,11 @@ for step in range(max_steps):
             _, tokens, mask, label = render_example(example)
             tokens = tokens.to(device)
             mask = mask.to(device)
+
+            max_len = raw_model.config.block_size
+            tokens = tokens[:, :max_len]
+            mask = mask[:, :max_len]
+
             # get the logits
             with torch.no_grad():
                 with torch.autocast(device_type=device, dtype=torch.bfloat16):
@@ -583,7 +607,7 @@ for step in range(max_steps):
     dt = (t1 - t0) #time difference in milliseconds
     tokens_per_sec = (train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size) / dt
     if master_process:
-        print(f"step{step:4D} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+        print(f"step{step:4d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
         with open(log_file, "a") as f:
             f.write(f"{step} train {loss_accum.item():.6f}\n")
 
